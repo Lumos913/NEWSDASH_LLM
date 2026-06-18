@@ -145,6 +145,8 @@ function buildIssuePrompt(regionId, period) {
 아래 JSON 객체 "하나만" 출력한다. 이 외의 텍스트는 단 한 글자도 출력하지 않는다.
 - 페이지를 읽었다는 설명, 근거 설명, 인용, 마크다운 코드블록(\`\`\`) 표시를 절대 붙이지 않는다.
 - 첫 글자는 반드시 "{", 마지막 글자는 반드시 "}"여야 한다. 그 앞뒤에 어떤 글자도 없어야 한다.
+- 기사 제목에 강조용 인용부호가 들어가더라도, title/summary 같은 문자열 값 안에 큰따옴표(")를
+  그대로 쓰면 JSON이 깨진다. 반드시 \\" 로 escape하거나 “ ” 같은 둥근 인용부호로 바꿔 쓴다.
 
 {
   "issues": [
@@ -177,7 +179,14 @@ ${headList}
 - 화제성 발언 (논란, 주목, 확산)
 - 단순 행사 인사말·의례적 축하 게시물은 제외
 
+너에게는 google_search 도구로 실시간 웹 검색 권한이 주어져 있다. 학습 데이터의 지식
+컷오프 이후 시점이거나 검토 기간이 미래처럼 보이더라도, 그건 검색 도구로 직접 확인하면
+되는 사실일 뿐이니 "알 수 없다", "접근할 수 없다"는 이유로 거절하지 말고 반드시 도구를
+사용해 검색한 뒤 답하라.
+
 ---- 출력 형식 (JSON만 출력, 다른 텍스트 금지) ----
+- 문자열 값 안에 큰따옴표(")를 그대로 쓰면 JSON이 깨진다. 인용을 표현해야 하면 반드시
+  \\" 로 escape하거나 “ ” 같은 둥근 인용부호를 쓴다.
 {
   "official": "${heads[0] ? heads[0].name + ' ' + heads[0].title : ''}",
   "date": "검토 기간 내 가장 최근 게시 날짜 (YYYY-MM-DD)",
@@ -229,9 +238,6 @@ function safeParseJson(text) {
 // (https://github.com/google-gemini/gemini-cli/issues/8475)
 async function callGemini(systemPrompt, tools, maxAttempts = 5) {
   let lastError = new Error("Gemini API 호출 실패");
-  // 도구를 호출 안 한 채로 200 OK가 온 마지막 결과. 끝까지 한 번도 도구 호출에
-  // 성공하지 못하면 그냥 이거라도 반환한다 (완전히 빈손보다는 낫다).
-  let lastSoftFailure = null;
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const model = GEMINI_MODEL_FALLBACKS[attempt % GEMINI_MODEL_FALLBACKS.length];
@@ -273,24 +279,23 @@ async function callGemini(systemPrompt, tools, maxAttempts = 5) {
           "url_context 조회 결과:",
           urlMeta.map((m) => `${m.retrievedUrl} → ${m.urlRetrievalStatus}`).join(" | ")
         );
-        // urlContextMetadata도 같이 돌려줘서 호출부가 "출처 페이지를 하나도 못 읽었다"는
-        // 상황(가설 B)과 "다 읽었는데 JSON이 깨졌다"는 상황(가설 A)을 구분할 수 있게 한다.
-        return result;
       }
 
-      if (requestedUrlContext) {
-        // url_context를 요청했는데 응답에 메타데이터가 전혀 없으면, 도구 자체를
-        // 호출하지 않고 그냥 답했다는 뜻이다 (도구 호출은 모델이 자율적으로 결정한다).
-        // HTTP는 200이라 "성공"이지만 우리가 원하는 결과가 아니므로, 여기서 그냥 받아들이지
-        // 않고 429/503과 똑같이 다음 모델로 바꿔서 재시도한다 — gemini-3.1/2.5-flash-lite처럼
-        // 가벼운 모델은 이런 멀티스텝 브라우징 도구를 스스로 호출하지 않는 경우가 잦아서,
-        // 이걸 그대로 최종 응답으로 받아들이면 기사 분류가 항상 빈 결과로 끝난다.
-        lastSoftFailure = result;
+      // 이 앱의 모든 프롬프트는 "JSON 객체 하나만 출력"을 엄격한 규칙으로 못박아 둔다.
+      // 그런데도 모델이 (a) url_context를 요청했는데 호출하지 않거나, (b) JSON이 아닌
+      // 텍스트로 답하는 경우가 있다 — 예: 제목 안의 인용부호(")를 \"로 escape하지 않아
+      // JSON이 깨지는 경우, "2026년은 미래라 실시간 정보를 알 수 없다"는 식의 거절 응답 등.
+      // 둘 다 HTTP 200으로 "성공"하지만 호출부가 쓸 수 없는 응답이므로, 429/503과 똑같이
+      // 다음 모델로 바꿔 재시도한다. 그대로 받아들이면 기사 분류/SNS 브리핑이 늘 빈 결과나
+      // "JSON 파싱 실패"로 끝난다.
+      const noToolCall = requestedUrlContext && !(urlMeta && urlMeta.length > 0);
+      const notJson = !safeParseJson(result.text);
+
+      if (noToolCall || notJson) {
         if (attempt < maxAttempts - 1) {
+          const reason = noToolCall ? "url_context 미호출" : "JSON이 아닌 응답";
           const nextModel = GEMINI_MODEL_FALLBACKS[(attempt + 1) % GEMINI_MODEL_FALLBACKS.length];
-          console.warn(
-            `url_context 미호출(${model}) — ${nextModel} 모델로 바꿔 ${attempt + 2}/${maxAttempts}번째 시도`
-          );
+          console.warn(`${reason}(${model}) — ${nextModel} 모델로 바꿔 ${attempt + 2}/${maxAttempts}번째 시도`);
           continue;
         }
       }
