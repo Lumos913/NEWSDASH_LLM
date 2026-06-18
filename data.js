@@ -229,6 +229,9 @@ function safeParseJson(text) {
 // (https://github.com/google-gemini/gemini-cli/issues/8475)
 async function callGemini(systemPrompt, tools, maxAttempts = 5) {
   let lastError = new Error("Gemini API 호출 실패");
+  // 도구를 호출 안 한 채로 200 OK가 온 마지막 결과. 끝까지 한 번도 도구 호출에
+  // 성공하지 못하면 그냥 이거라도 반환한다 (완전히 빈손보다는 낫다).
+  let lastSoftFailure = null;
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const model = GEMINI_MODEL_FALLBACKS[attempt % GEMINI_MODEL_FALLBACKS.length];
@@ -263,28 +266,58 @@ async function callGemini(systemPrompt, tools, maxAttempts = 5) {
       const urlContextMetadata = candidate?.urlContextMetadata;
       const urlMeta = urlContextMetadata?.urlMetadata;
       const requestedUrlContext = Array.isArray(tools) && tools.some((t) => t && "url_context" in t);
+      const result = { text: parts.map((p) => p.text || "").join(""), urlContextMetadata };
+
       if (urlMeta && urlMeta.length > 0) {
         console.info(
           "url_context 조회 결과:",
           urlMeta.map((m) => `${m.retrievedUrl} → ${m.urlRetrievalStatus}`).join(" | ")
         );
-      } else if (requestedUrlContext) {
+        // urlContextMetadata도 같이 돌려줘서 호출부가 "출처 페이지를 하나도 못 읽었다"는
+        // 상황(가설 B)과 "다 읽었는데 JSON이 깨졌다"는 상황(가설 A)을 구분할 수 있게 한다.
+        return result;
+      }
+
+      if (requestedUrlContext) {
         // url_context를 요청했는데 응답에 메타데이터가 전혀 없으면, 도구 자체를
         // 호출하지 않고 그냥 답했다는 뜻이다 (도구 호출은 모델이 자율적으로 결정한다).
-        console.warn("url_context를 요청했지만 응답에 urlContextMetadata가 없습니다 — 모델이 도구를 호출하지 않은 것으로 보입니다.");
+        // HTTP는 200이라 "성공"이지만 우리가 원하는 결과가 아니므로, 여기서 그냥 받아들이지
+        // 않고 429/503과 똑같이 다음 모델로 바꿔서 재시도한다 — gemini-3.1/2.5-flash-lite처럼
+        // 가벼운 모델은 이런 멀티스텝 브라우징 도구를 스스로 호출하지 않는 경우가 잦아서,
+        // 이걸 그대로 최종 응답으로 받아들이면 기사 분류가 항상 빈 결과로 끝난다.
+        lastSoftFailure = result;
+        if (attempt < maxAttempts - 1) {
+          const nextModel = GEMINI_MODEL_FALLBACKS[(attempt + 1) % GEMINI_MODEL_FALLBACKS.length];
+          console.warn(
+            `url_context 미호출(${model}) — ${nextModel} 모델로 바꿔 ${attempt + 2}/${maxAttempts}번째 시도`
+          );
+          continue;
+        }
       }
-      // urlContextMetadata도 같이 돌려줘서 호출부가 "출처 페이지를 하나도 못 읽었다"는
-      // 상황(가설 B)과 "다 읽었는데 JSON이 깨졌다"는 상황(가설 A)을 구분할 수 있게 한다.
-      return { text: parts.map((p) => p.text || "").join(""), urlContextMetadata };
+
+      return result;
     }
 
     const status = response ? response.status : null;
     // 에러 응답 본문엔 어떤 쿼터(분당/일일/모델별)가 초과됐는지 등 실제 원인이 들어있다.
     let detail = "";
+    let retryDelaySec = NaN;
     if (response) {
       try {
         const errBody = await response.json();
         detail = errBody?.error?.message || "";
+        // Gemini API는 Retry-After 헤더를 보내지 않는다. 실제로 얼마나 기다려야 하는지는
+        // error.details의 RetryInfo(retryDelay, 예: "44s") 또는 메시지 안의
+        // "Please retry in 44.9s" 문구에만 들어있다. 이걸 안 읽으면 항상 고정
+        // 1.2초만 기다리고 다음 모델로 넘어가는데, 쿼터는 그 안에 절대 안 풀려서
+        // 5번 시도가 전부 똑같이 즉시 429로 실패한다.
+        const retryInfo = errBody?.error?.details?.find((d) => d.retryDelay);
+        if (retryInfo) {
+          retryDelaySec = parseFloat(retryInfo.retryDelay);
+        } else {
+          const match = detail.match(/retry in ([\d.]+)\s*s/i);
+          if (match) retryDelaySec = parseFloat(match[1]);
+        }
       } catch (e) {
         // 본문이 JSON이 아니면 무시
       }
@@ -297,8 +330,7 @@ async function callGemini(systemPrompt, tools, maxAttempts = 5) {
     }
 
     const nextModel = GEMINI_MODEL_FALLBACKS[(attempt + 1) % GEMINI_MODEL_FALLBACKS.length];
-    const retryAfterSec = response ? Number(response.headers.get("Retry-After")) : NaN;
-    const waitMs = Number.isFinite(retryAfterSec) && retryAfterSec > 0 ? retryAfterSec * 1000 : 1200;
+    const waitMs = Number.isFinite(retryDelaySec) && retryDelaySec > 0 ? retryDelaySec * 1000 + 250 : 1200;
     console.warn(
       `Gemini API(${model}) ${status ?? "네트워크 오류"} — ${nextModel} 모델로 바꿔 ${attempt + 2}/${maxAttempts}번째 시도${detail ? `\n  └ ${detail}` : ""}`
     );
@@ -394,8 +426,10 @@ function fetchRegionData(regionId) {
         classifiedArticlesOut = [];
         classifyEmptyNote = reason;
       } else {
-        issuesOut = issueData.issues?.map((i) => `${i.title} — ${i.summary}`) || ["현안 데이터를 가져오지 못했습니다."];
-        classifiedArticlesOut = issueData.classifiedArticles || [];
+        issuesOut = Array.isArray(issueData.issues) && issueData.issues.length > 0
+          ? issueData.issues.map((i) => `${i.title} — ${i.summary}`)
+          : ["현안 데이터를 가져오지 못했습니다."];
+        classifiedArticlesOut = Array.isArray(issueData.classifiedArticles) ? issueData.classifiedArticles : [];
         if (classifiedArticlesOut.length === 0) {
           classifyEmptyNote = "관련 기사를 찾지 못했습니다.";
           // JSON 파싱은 됐지만 결과가 빈 배열인 경우 — 모델이 왜 못 찾았다고 판단했는지
@@ -404,11 +438,17 @@ function fetchRegionData(regionId) {
         }
       }
 
+      // snsData가 JSON 파싱은 됐어도 items가 배열이 아니면(필드 누락, 모델이 문자열/객체로
+      // 잘못 채움 등) drawBriefingTab의 for...of가 "is not iterable"로 죽으므로 여기서 검증한다.
+      const briefingOut = snsData && Array.isArray(snsData.items)
+        ? snsData
+        : { official: snsData?.official || "", date: snsData?.date || "", items: ["SNS 데이터를 가져오지 못했습니다."] };
+
       const finalData = {
         regionId,
         regionName: region.name,
         isLoading: false,
-        briefing: snsData || { official: "", date: "", items: ["SNS 데이터를 가져오지 못했습니다."] },
+        briefing: briefingOut,
         issues: issuesOut,
         classifiedArticles: classifiedArticlesOut,
         classifyEmptyNote,
