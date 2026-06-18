@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<!--
+  실행 방법: 이 파일과 같은 폴더에 다음이 모두 있어야 합니다.
+    - secret.js (config.apiKey 정의), map_data.js, data.js, sketch.js
+    - assets/header_strip_muted.jpg (지도 패널 상단 일러스트)
+  파일을 그대로 더블클릭하면 브라우저 보안 정책상 로컬 이미지 로드가 막힐 수 있으니,
+  VSCode의 Live Server 확장이나 `python3 -m http.server` 같은 간단한 로컬 서버로 열어주세요.
+-->
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <title>지역 시사이슈 대시보드 (p5.js)</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Serif+KR:wght@500;600&family=Noto+Sans+KR:wght@400;500&display=swap" rel="stylesheet">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/p5.min.js"></script>
+  <style>
+    body {
+      margin: 0;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+      background: #ded7c4;
+      font-family: "Noto Sans KR", -apple-system, "Apple SD Gothic Neo", "Malgun Gothic", sans-serif;
+    }
+    canvas {
+      box-shadow: 0 3px 16px rgba(40, 35, 28, 0.18);
+    }
+  </style>
+</head>
+<body>
+  <script src="secret.js"></script>
+  <script src="map_data.js"></script>
+  <script src="data.js"></script>
+  <script src="sketch.js"></script>
+</body>
+</html>
